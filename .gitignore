@@ -1,0 +1,28 @@
+# Configuración local y credenciales potenciales
+config.yaml
+*.env
+.env*
+!config.example.yaml
+
+# Datos y artefactos generados
+salidas/
+cache/
+*.log
+*.zip
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.Python
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+
+# Editores y sistema operativo
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

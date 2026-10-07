@@ -1,0 +1,67 @@
+# Copia este archivo como config.yaml y adapta solo valores locales.
+# No publiques config.yaml: puede contener rutas, cookies o una contraseña de Tor.
+youtube:
+  use_tor: false
+  paranoid_mode: false
+  rotate_every_pages: 10
+  rotate_ua_every_pages: 3
+  player_clients: [web_safari, tv_embedded, web, mweb]
+  use_cookies: false
+  cookies_browser: firefox
+download:
+  mode: video
+  quality: 1080
+  prefer_max_quality: true
+  container_preference: mkv
+  limit_rate: "0"
+  sleep_requests: 3
+  sleep_interval: 5
+  concurrent_fragments: 5
+transcription:
+  engine: faster-whisper
+  model: medium
+  language: auto
+  vad: true
+  word_timestamps: true
+  prefer_whisper: false
+comments:
+  enabled: true
+  sort: top
+  max_comments: 500
+  max_replies_per_thread: 50
+  include_replies: true
+  passes: 1
+  delay_between_passes_sec: [60, 180]
+  rotate_on_pass: true
+  shadow_throttle_detection: true
+analytics:
+  sentiment: true
+  topics: false
+  toxicity: false
+  social_graph: true
+  heatmap: true
+humanization:
+  mode: equilibrado
+  level: medio
+  circadian: true
+  fatigue: true
+  micro_breaks: true
+  macro_breaks: true
+  sleep_schedule: false
+anonymous_browser:
+  enabled: true
+  headless: true
+  use_tor: false
+  canvas_noise: true
+  webgl_spoof: true
+  webrtc_block: true
+tor:
+  socks_host: 127.0.0.1
+  socks_port: 9050
+  control_port: 9051
+  control_password: null
+  stream_isolation: true
+  verify_new_identity: true
+  circuit_max_age_seconds: 600
+output:
+  dir: salidas

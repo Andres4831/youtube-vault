@@ -1,0 +1,20 @@
+# Dependencias de ejecución. Úsalas solo sobre contenido que tengas derecho a procesar.
+# Respeta los Términos de YouTube, derechos de autor, privacidad y ley aplicable.
+requests>=2.31
+urllib3>=1.26
+PyYAML>=6.0
+yt-dlp>=2024.1.1
+pytubefix>=8.0
+youtube-transcript-api>=0.6
+youtube-comment-downloader>=0.1
+faster-whisper>=1.0
+playwright>=1.40
+beautifulsoup4>=4.12
+PySocks>=1.7
+stem>=1.8
+mutagen>=1.47
+networkx>=3.0
+python-louvain>=0.16
+matplotlib>=3.7
+pysentimiento>=0.7
+browser-cookie3>=0.19

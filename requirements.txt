@@ -18,3 +18,4 @@ python-louvain>=0.16
 matplotlib>=3.7
 pysentimiento>=0.7
 browser-cookie3>=0.19
+Flask>=3.0

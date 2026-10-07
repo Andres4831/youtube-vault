@@ -71,7 +71,7 @@ import base64, csv, hashlib, html as html_lib, json, logging, os
 import random, re, shutil, socket, subprocess, sys, time, zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any, Callable, Iterator, Optional
 from urllib.parse import parse_qs, urlparse
 
 import requests
@@ -183,7 +183,9 @@ CACHE_DIR = Path("cache")
 POT_CACHE = CACHE_DIR / "po_tokens.json"
 DEFAULT_OUTPUT = Path("salidas")
 
-INNERTUBE_API_KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
+# Opcional y exclusivamente local. No incluyas este valor en config.yaml, commits o issues.
+# El flujo principal usa yt-dlp; este valor solo habilita el fallback InnerTube.
+INNERTUBE_API_KEY = os.environ.get("YOUTUBE_VAULT_INNERTUBE_KEY", "").strip()
 INNERTUBE_WEB_VERSION = "2.20240620.00.00"
 INNERTUBE_ANDROID_VERSION = "19.29.37"
 INNERTUBE_IOS_VERSION = "19.29.1"
@@ -299,7 +301,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "transcription": {
         "engine": "faster-whisper", "model": "medium", "language": "auto",
-        "vad": True, "word_timestamps": True, "prefer_whisper": False,
+        "vad": True, "word_timestamps": True, "prefer_whisper": True,
+        "device": "auto", "compute_type": "int8", "beam_size": 5,
+        "best_of": 5, "condition_on_previous_text": True,
     },
     "comments": {
         "enabled": True, "sort": "top", "max_comments": 5000,
@@ -1157,6 +1161,8 @@ def innertube_context(client: str = "WEB", visitor: Optional[str] = None) -> dic
 
 def innertube_post(session: requests.Session, endpoint: str, payload: dict,
                    timeout: float = 25.0) -> dict:
+    if not INNERTUBE_API_KEY:
+        raise RuntimeError("Fallback InnerTube deshabilitado: define YOUTUBE_VAULT_INNERTUBE_KEY solo en tu entorno local")
     url = f"https://www.youtube.com/youtubei/v1/{endpoint}"
     params = {"key": INNERTUBE_API_KEY, "prettyPrint": "false"}
     r = session.post(url, params=params, json=payload, timeout=timeout)
@@ -1747,7 +1753,29 @@ def srt_ts(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
-def write_transcript_files(dest: Path, segs: list[dict], source: str, video_id: str) -> None:
+def _normalise_transcript_segments(items: Any) -> list[dict]:
+    """Convierte respuestas de YouTube/Whisper a un esquema estable y ordenado."""
+    clean: list[dict] = []
+    for item in items or []:
+        get = (lambda key, default=None: item.get(key, default)) if isinstance(item, dict) else \
+              (lambda key, default=None: getattr(item, key, default))
+        text = re.sub(r"\s+", " ", str(get("text", "") or "")).strip()
+        if not text:
+            continue
+        try:
+            start = max(0.0, float(get("start", 0) or 0))
+            duration = max(0.0, float(get("duration", 0) or 0))
+            end = float(get("end", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        end = end if end > start else start + duration
+        clean.append({"start": start, "end": max(start, end),
+                      "duration": max(0.0, end - start), "text": text})
+    return sorted(clean, key=lambda segment: (segment["start"], segment["end"]))
+
+
+def write_transcript_files(dest: Path, segs: list[dict], source: str, video_id: str,
+                           details: Optional[dict] = None) -> None:
     """Guarda la transcripción en subtitles/."""
     subs_dir = _subdir(dest, "subtitles")
     srt_lines = []
@@ -1762,7 +1790,16 @@ def write_transcript_files(dest: Path, segs: list[dict], source: str, video_id: 
     (subs_dir / "transcription.vtt").write_text("WEBVTT\n\n" + srt.replace(",", "."), encoding="utf-8")
     (subs_dir / "transcription.txt").write_text(
         "\n\n".join(s["text"] for s in segs if s.get("text")), encoding="utf-8")
-    save_json(subs_dir / "transcription.json", {"source": source, "segments": segs})
+    transcript_meta = {
+        "schema_version": "1.0", "video_id": video_id, "source": source,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "segment_count": len(segs),
+        "duration_seconds": round(max((float(s.get("end") or 0) for s in segs), default=0), 3),
+        "segments": segs,
+    }
+    if details:
+        transcript_meta["processing"] = details
+    save_json(subs_dir / "transcription.json", transcript_meta)
     md = [f"# Transcripción `{video_id}`", "", f"_Fuente: {source}_", ""]
     for s in segs:
         md.append(f"[{srt_ts(float(s['start']))}] {s.get('text','')}")
@@ -1776,24 +1813,25 @@ def transcribe_audio(audio_path: Optional[Path], dest: Path, cfg: dict, video_id
     want_words = bool(tcfg.get("word_timestamps", True))
     segs: list[dict] = []
     source = "none"
+    processing: dict[str, Any] = {"requested_model": model_name, "requested_language": language}
 
-    yt_subs = fetch_youtube_subs(video_id)
-    if yt_subs:
-        segs = [{"start": float(x.get("start") or 0),
-                 "duration": float(x.get("duration") or 0),
-                 "end": float(x.get("start") or 0) + float(x.get("duration") or 0),
-                 "text": x.get("text") or ""} for x in yt_subs]
-        source = "youtube-transcript-api"
-        console_ok(f"Subtítulos YouTube: {len(segs)} cues")
-
-    if (not segs) and WHISPER_AVAILABLE and audio_path and audio_path.exists():
+    prefer_whisper = bool(tcfg.get("prefer_whisper", True))
+    if prefer_whisper and WHISPER_AVAILABLE and audio_path and audio_path.exists():
         live_status(f"faster-whisper modelo={model_name}…")
         try:
-            model = WhisperModel(model_name, device="cpu", compute_type="int8")
+            requested_device = str(tcfg.get("device") or "auto")
+            device = "cuda" if requested_device == "auto" and shutil.which("nvidia-smi") else \
+                     ("cpu" if requested_device == "auto" else requested_device)
+            compute_type = str(tcfg.get("compute_type") or ("float16" if device == "cuda" else "int8"))
+            model = WhisperModel(model_name, device=device, compute_type=compute_type)
             lang = None if language in {None, "", "auto"} else language
             segments, info = model.transcribe(str(audio_path), language=lang,
                                               vad_filter=bool(tcfg.get("vad", True)),
-                                              word_timestamps=want_words)
+                                              word_timestamps=want_words,
+                                              beam_size=max(1, int(tcfg.get("beam_size") or 5)),
+                                              best_of=max(1, int(tcfg.get("best_of") or 5)),
+                                              condition_on_previous_text=bool(
+                                                  tcfg.get("condition_on_previous_text", True)))
             segs = []
             for s in segments:
                 item = {"start": float(s.start), "end": float(s.end),
@@ -1803,16 +1841,29 @@ def transcribe_audio(audio_path: Optional[Path], dest: Path, cfg: dict, video_id
                                       "end": float(w.end)} for w in s.words if w.start is not None]
                 segs.append(item)
             source = f"faster-whisper:{model_name}"
+            processing.update({"device": device, "compute_type": compute_type,
+                               "detected_language": getattr(info, "language", None),
+                               "language_probability": getattr(info, "language_probability", None),
+                               "vad_filter": bool(tcfg.get("vad", True))})
             console_ok(f"Whisper: {len(segs)} segmentos, idioma={getattr(info, 'language', '?')}")
         except Exception as exc:
             if not segs:
                 raise RuntimeError(f"Whisper falló: {exc}")
 
     if not segs:
+        yt_subs = fetch_youtube_subs(video_id)
+        if yt_subs:
+            segs = _normalise_transcript_segments(yt_subs)
+            source = "youtube-transcript-api"
+            processing["fallback"] = "youtube_subtitles"
+            console_ok(f"Subtítulos YouTube: {len(segs)} cues")
+
+    if not segs:
         raise RuntimeError("Ni subtítulos ni Whisper disponibles")
 
-    write_transcript_files(dest, segs, source, video_id)
-    return {"source": source, "segments": len(segs)}
+    segs = _normalise_transcript_segments(segs)
+    write_transcript_files(dest, segs, source, video_id, processing)
+    return {"source": source, "segments": len(segs), "processing": processing}
 
 
 # ============================================================
@@ -2441,6 +2492,32 @@ def save_json(path: Path, data: Any) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def write_bundle_manifest(dest: Path, meta: dict, pipeline: dict, files: Optional[dict] = None) -> Path:
+    """Crea un inventario auditable del bundle para intercambio y archivado."""
+    inventory = []
+    for path in sorted(p for p in dest.rglob("*") if p.is_file() and p.name != "manifest.json"):
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        inventory.append({
+            "path": path.relative_to(dest).as_posix(),
+            "bytes": path.stat().st_size,
+            "sha256": digest,
+        })
+    manifest = {
+        "schema_version": "1.0",
+        "tool": {"name": "YouTube Vault", "version": VERSION},
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "video": {key: meta.get(key) for key in ("id", "title", "channel", "webpage_url", "upload_date")},
+        "pipeline": pipeline,
+        "reported_files": files or {},
+        "inventory": inventory,
+        "notice": "Los artefactos pueden contener material protegido o datos personales. "
+                  "Compártelos únicamente cuando tengas autorización y base legal.",
+    }
+    path = dest / "manifest.json"
+    save_json(path, manifest)
+    return path
+
+
 def ffmpeg_ok() -> bool:
     return shutil.which("ffmpeg") is not None
 
@@ -2462,6 +2539,7 @@ def write_leeme(dest: Path, meta: dict, files: Optional[dict] = None) -> None:
         "  comments/   → comments.json / csv / md / html",
         "  analytics/  → analytics.json, sentiment_report.json, html",
         "  images/     → thumbnail, waveform, storyboard, graph, heatmap",
+        "  manifest.json → inventario SHA-256 y resumen reproducible del procesamiento",
         "",
         "ARCHIVOS GENERADOS:",
     ]
@@ -3145,14 +3223,23 @@ def menu_repair(cfg: dict, session: requests.Session) -> requests.Session:
 
 def process_video(url: str, cfg: dict, session: requests.Session, *,
                   do_download: bool = True, do_transcript: bool = True,
-                  do_comments: bool = True, do_analytics: bool = True) -> dict:
+                  do_comments: bool = True, do_analytics: bool = True,
+                  on_status: Optional[Callable[[dict], None]] = None) -> dict:
     """Pipeline completo: metadata → descarga → transcripción → comentarios → analytics."""
     vid = extract_video_id(url)
     if not vid:
         raise RuntimeError("URL/ID inválido")
     use_tor_meta = bool((cfg.get("youtube") or {}).get("use_tor"))
+    started_at = datetime.now(timezone.utc)
+    def status(stage: str, progress_value: int, message: str) -> None:
+        if on_status:
+            try:
+                on_status({"stage": stage, "progress": progress_value, "message": message})
+            except Exception:
+                logging.debug("status callback failed", exc_info=True)
     prevent_system_sleep(True)
     try:
+        status("metadata", 5, "Analizando metadatos…")
         meta = extract_metadata(url, cfg, session, use_tor=use_tor_meta)
         dest = output_dir_for(cfg, meta.get("id") or vid, meta.get("title") or "video")
 
@@ -3164,17 +3251,24 @@ def process_video(url: str, cfg: dict, session: requests.Session, *,
         console_kv("Canal", meta.get("channel"))
         console_kv("Vistas", meta.get("view_count"))
         files: dict[str, str] = {}
+        pipeline: dict[str, Any] = {"started_at": started_at.isoformat(), "stages": {}}
 
         if do_download:
+            status("download", 15, "Descargando contenido…")
             mode = str((cfg.get("download") or {}).get("mode") or "video")
             if mode != "subs_only":
                 dl = download_with_fallback(meta["id"], dest, cfg, session, meta=meta)
                 console_ok(f"Descarga {dl.get('source')} / {dl.get('client')}")
                 files.update(postprocess_media(dest, mode, meta))
+                pipeline["stages"]["download"] = {"status": "ok", "source": dl.get("source"),
+                                                    "client": dl.get("client"), "mode": mode}
+                status("download", 45, "Descarga terminada.")
             else:
                 console_info("Solo subtítulos: se omite video")
+                pipeline["stages"]["download"] = {"status": "skipped", "mode": mode}
 
         if do_transcript:
+            status("transcription", 50, "Generando transcripción…")
             video_dir = _subdir(dest, "video")
             audio: Optional[Path] = None
             for pat in ("audio.m4a", "audio.mp3", "audio.opus", "audio.ogg", "audio.wav"):
@@ -3189,10 +3283,14 @@ def process_video(url: str, cfg: dict, session: requests.Session, *,
             try:
                 tr = transcribe_audio(audio, dest, cfg, meta["id"])
                 console_ok(f"Transcripción {tr}")
+                pipeline["stages"]["transcription"] = {"status": "ok", **tr}
+                status("transcription", 68, "Transcripción terminada.")
             except Exception as exc:
                 console_fail(f"Transcripción: {exc}")
+                pipeline["stages"]["transcription"] = {"status": "failed", "error": str(exc)}
 
         if do_comments and (cfg.get("comments") or {}).get("enabled", True):
+            status("comments", 72, "Recopilando comentarios…")
             cc = cfg.get("comments") or {}
             payload = download_all_comments(
                 session, meta["id"], cfg,
@@ -3203,12 +3301,26 @@ def process_video(url: str, cfg: dict, session: requests.Session, *,
                 use_tor=use_tor_meta)
             export_comments(dest, payload)
             console_ok(f"Comentarios: {payload.get('total_top_level')}")
+            pipeline["stages"]["comments"] = {"status": "ok", "top_level": payload.get("total_top_level"),
+                                                 "total_with_replies": payload.get("total_with_replies")}
+            status("comments", 84, "Comentarios organizados.")
             if do_analytics:
-                run_analytics(dest, payload, meta, cfg)
-                console_ok("Analytics listos")
+                status("analytics", 88, "Generando análisis…")
+                try:
+                    report = run_analytics(dest, payload, meta, cfg)
+                    pipeline["stages"]["analytics"] = {"status": "ok", "total": report.get("total")}
+                    status("analytics", 95, "Análisis terminado.")
+                    console_ok("Analytics listos")
+                except Exception as exc:
+                    pipeline["stages"]["analytics"] = {"status": "failed", "error": str(exc)}
+                    console_fail(f"Analytics: {exc}")
 
+        pipeline["finished_at"] = datetime.now(timezone.utc).isoformat()
+        pipeline["duration_seconds"] = round((datetime.now(timezone.utc) - started_at).total_seconds(), 3)
+        write_bundle_manifest(dest, meta, pipeline, files)
         write_leeme(dest, meta, files)
         export_package(dest)
+        status("complete", 100, "Proceso terminado y verificado.")
         HUMAN.between_ops()
         return {"ok": True, "dir": str(dest), "meta": meta, "files": files}
     finally:
